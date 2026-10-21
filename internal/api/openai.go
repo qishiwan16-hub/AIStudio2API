@@ -218,6 +218,17 @@ func (s *server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
+	// 变体模型前缀检测：假流式 / 抗截断
+	if prefix, realModel := stripVariantPrefix(request.Model); prefix != "" {
+		switch prefix {
+		case variantPrefixFakeStream:
+			s.handleFakeStream(w, r, request, realModel)
+			return
+		case variantPrefixAntiTrunc:
+			s.handleAntiTruncation(w, r, request, realModel)
+			return
+		}
+	}
 	requestID := newID("chatcmpl")
 	generateRequest, err := request.toGenerateRequest(requestID)
 	if err != nil {

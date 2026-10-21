@@ -2309,7 +2309,35 @@ func (service *trackedService) Models(context.Context) ([]aistudio.Model, error)
 	if len(models) == 0 && service.state.Load() != serviceRunning {
 		return nil, &serviceStoppedError{launching: service.state.Load() == serviceLaunching}
 	}
-	return service.withAliases(service.pool.PublicModels(models)), nil
+	result := service.withAliases(service.pool.PublicModels(models))
+	// 为每个支持 generateContent 的模型生成假流式和抗截断变体
+	var variants []aistudio.Model
+	for _, m := range result {
+		hasGenerate := false
+		for _, method := range m.Methods {
+			if method == "generateContent" {
+				hasGenerate = true
+				break
+			}
+		}
+		if !hasGenerate {
+			continue
+		}
+		for _, prefix := range []string{"fake-stream-", "anti-trunc-"} {
+			v := m
+			v.ID = prefix + m.ID
+			v.Name = prefix + m.Name
+			switch prefix {
+			case "fake-stream-":
+				v.Description = m.Description + " (fake-stream: upstream streaming + heartbeat keepalive, delivers complete result)"
+			case "anti-trunc-":
+				v.Description = m.Description + " (anti-truncation: synthetic tool injection to bypass output truncation)"
+			}
+			variants = append(variants, v)
+		}
+	}
+	result = append(result, variants...)
+	return result, nil
 }
 
 // withAliases 把 MODEL_MAPPING 中目标在目录内的别名加入公开目录，字段取自目标模型，与目录 ID 同名的别名替换该条目，同名别名以先写的为准
