@@ -12,6 +12,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
 	"sync"
@@ -32,6 +33,16 @@ var cutShortReasons = map[string]bool{
 	"max_output_tokens": true,
 	"length":            true,
 	"recitation":        true,
+}
+
+// hasUserTools 检查请求是否已带有用户自定义的 function calling 工具
+func hasUserTools(tools []openAITool) bool {
+	for _, t := range tools {
+		if t.Type == "function" && t.Function.Name != "" && !strings.HasPrefix(t.Function.Name, "router_emit_") {
+			return true
+		}
+	}
+	return false
 }
 
 // ---------- 变体模型前缀检测 ----------
@@ -66,6 +77,7 @@ func (s *server) handleFakeStream(
 	request chatRequest, realModel string,
 ) {
 	requestID := newID("chatcmpl")
+	log.Printf("[fake-stream] 开始处理 model=%s requestID=%s", realModel, requestID)
 	request.Model = realModel
 	request.Stream = false
 
@@ -134,6 +146,9 @@ waitLoop:
 		writeVariantError(w, cr.err)
 		return
 	}
+
+	log.Printf("[fake-stream] 上游完成 model=%s, textLen=%d, toolCalls=%d, finishReason=%s",
+		realModel, cr.result.text.Len(), len(cr.result.toolCalls), cr.result.finishReason)
 
 	s.thoughtSignatures.Remember(cr.result.toolCalls)
 	media := s.mediaOutputFor(r)
@@ -261,6 +276,7 @@ func (s *server) handleAntiTruncation(
 	request chatRequest, realModel string,
 ) {
 	requestID := newID("chatcmpl")
+	log.Printf("[anti-trunc] 开始处理 model=%s requestID=%s", realModel, requestID)
 	request.Model = realModel
 	created := time.Now().Unix()
 	displayModel := variantPrefixAntiTrunc + realModel
@@ -284,6 +300,12 @@ func (s *server) handleAntiTruncation(
 		var lastResult *generationResult
 		var lastRealCalls []aistudio.FunctionCall
 
+		// 检测用户原始请求是否带有 function calling 工具
+		userHasTools := hasUserTools(request.Tools)
+		if userHasTools {
+			log.Printf("[anti-trunc] 用户请求已包含 function tools，使用 system prompt 续写策略")
+		}
+
 		originalMessages := make([]chatMessage, len(request.Messages))
 		copy(originalMessages, request.Messages)
 
@@ -305,26 +327,51 @@ func (s *server) handleAntiTruncation(
 				)
 			}
 
-			// 注入合成工具
-			injectAntiTruncTools(&reqCopy, toolName)
+			// 注入合成工具（仅在用户无自定义 tools 时使用工具注入策略）
+			if !userHasTools {
+				injectAntiTruncTools(&reqCopy, toolName)
+			}
 
-			// 注入系统指令（通过 extra message 方式）
-			controlInstruction, _ := json.Marshal(buildControlInstruction(toolName, continuation > 0))
+			// 注入系统指令
+			var controlText string
+			if userHasTools {
+				// 用户有 tools 时用纯 system prompt 指令，不注入合成工具
+				controlText = buildPromptOnlyInstruction(continuation > 0)
+			} else {
+				controlText = buildControlInstruction(toolName, continuation > 0)
+			}
+			controlInstruction, _ := json.Marshal(controlText)
 			reqCopy.Messages = append([]chatMessage{
 				{Role: "system", Content: controlInstruction},
 			}, reqCopy.Messages...)
 
 			genReq, err := reqCopy.toGenerateRequest(requestID)
 			if err != nil {
-				done <- workResult{err: err}
+				// 首轮构建失败是致命错误，续传轮次构建失败则 fallback 返回已有内容
+				if continuation == 0 {
+					done <- workResult{err: err}
+				} else {
+					log.Printf("[anti-trunc] 续传第 %d 轮请求构建失败，返回已有内容: %v", continuation, err)
+					done <- workResult{collectedText: collected.String(), lastResult: lastResult, realCalls: lastRealCalls}
+				}
 				return
 			}
 			if err := s.restoreMediaLinks(genReq.Contents); err != nil {
-				done <- workResult{err: err}
+				if continuation == 0 {
+					done <- workResult{err: err}
+				} else {
+					log.Printf("[anti-trunc] 续传第 %d 轮 restoreMediaLinks 失败，返回已有内容: %v", continuation, err)
+					done <- workResult{collectedText: collected.String(), lastResult: lastResult, realCalls: lastRealCalls}
+				}
 				return
 			}
 			if err := inlineRemoteMedia(r.Context(), genReq.Contents); err != nil {
-				done <- workResult{err: err}
+				if continuation == 0 {
+					done <- workResult{err: err}
+				} else {
+					log.Printf("[anti-trunc] 续传第 %d 轮 inlineRemoteMedia 失败，返回已有内容: %v", continuation, err)
+					done <- workResult{collectedText: collected.String(), lastResult: lastResult, realCalls: lastRealCalls}
+				}
 				return
 			}
 			s.thoughtSignatures.Restore(genReq.Contents)
@@ -332,25 +379,48 @@ func (s *server) handleAntiTruncation(
 
 			events, err := s.service.Generate(r.Context(), genReq)
 			if err != nil {
-				done <- workResult{err: err}
+				// 续传轮次的 Generate 失败时 fallback
+				if continuation == 0 {
+					done <- workResult{err: err}
+				} else {
+					log.Printf("[anti-trunc] 续传第 %d 轮 Generate 失败，返回已有内容: %v", continuation, err)
+					done <- workResult{collectedText: collected.String(), lastResult: lastResult, realCalls: lastRealCalls}
+				}
 				return
 			}
 
 			result, err := consumeEvents(r.Context(), events, nil)
 			if err != nil {
-				done <- workResult{err: err}
+				if continuation == 0 {
+					done <- workResult{err: err}
+				} else {
+					log.Printf("[anti-trunc] 续传第 %d 轮 consumeEvents 失败，返回已有内容: %v", continuation, err)
+					done <- workResult{collectedText: collected.String(), lastResult: lastResult, realCalls: lastRealCalls}
+				}
 				return
 			}
 
 			lastResult = &result
-			syntheticContent, realCalls := extractSyntheticContent(&result, toolName)
-			lastRealCalls = realCalls
+			var newContent string
+			if !userHasTools {
+				var realCalls []aistudio.FunctionCall
+				newContent, realCalls = extractSyntheticContent(&result, toolName)
+				lastRealCalls = realCalls
+			} else {
+				// 纯 prompt 模式，直接取 text 输出
+				newContent = result.text.String()
+				lastRealCalls = result.toolCalls
+			}
 
-			if syntheticContent != "" {
-				collected.WriteString(syntheticContent)
-			} else if text := result.text.String(); text != "" {
+			if newContent != "" {
+				collected.WriteString(newContent)
+			} else if text := result.text.String(); text != "" && !userHasTools {
+				// 合成工具未被调用，fallback 到 text
 				collected.WriteString(text)
 			}
+
+			log.Printf("[anti-trunc] 第 %d 轮完成，finishReason=%s，累计长度=%d",
+				continuation, result.finishReason, collected.Len())
 
 			if !isCutShort(result.finishReason) || collected.Len() == 0 {
 				break
@@ -407,7 +477,21 @@ waitLoop:
 	}
 	// 抗截断完成后强制 finish 为 stop
 	wr.lastResult.finishReason = "stop"
+	log.Printf("[anti-trunc] 完成 model=%s, 最终文本长度=%d, 真实工具调用=%d",
+		realModel, len(wr.collectedText), len(wr.lastResult.toolCalls))
 	emitFullResult(w, requestID, created, displayModel, wr.lastResult, request.Tools, request.StreamOptions.IncludeUsage)
+}
+
+// buildPromptOnlyInstruction 用户有自定义 tools 时的纯 system prompt 续写指令（不注入合成工具）
+func buildPromptOnlyInstruction(continuation bool) string {
+	if continuation {
+		return "Your previous reply was truncated. Continue outputting all remaining content " +
+			"directly. Do not repeat what was already output. Continue from the exact point " +
+			"where the previous reply ended. Preserve language, formatting, and any unfinished " +
+			"sentence or markup."
+	}
+	return "Provide a complete and thorough response. If the response is long, ensure you " +
+		"cover all requested content without omitting any sections."
 }
 
 // ---------- 公共辅助 ----------

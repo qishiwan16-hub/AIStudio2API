@@ -2324,6 +2324,10 @@ func (service *trackedService) Models(context.Context) ([]aistudio.Model, error)
 			continue
 		}
 		for _, prefix := range []string{"fake-stream-", "anti-trunc-"} {
+			// 已有官方 output_continuation 能力的模型跳过 anti-trunc 变体，避免双重续写
+			if prefix == "anti-trunc-" && m.Capabilities["output_continuation"] {
+				continue
+			}
 			v := m
 			v.ID = prefix + m.ID
 			v.Name = prefix + m.Name
