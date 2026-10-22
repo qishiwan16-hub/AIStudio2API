@@ -123,6 +123,7 @@ type AccountConfig struct {
 	Proxy    string `json:"proxy"`
 	Locale   string `json:"locale"`
 	Timezone string `json:"timezone"`
+	AuthUser string `json:"auth_user,omitempty"`
 }
 
 // ResourceBinding 记录上游资源的创建账户

@@ -157,7 +157,7 @@ func newGoWAARuntime(ctx context.Context, options camoufoxnative.Options) (*goWA
 	runtime.headers = http.Header{}
 	runtime.headers.Set("user-agent", runtime.userAgent)
 	runtime.headers.Set("x-goog-api-key", apiKey)
-	runtime.headers.Set("x-goog-authuser", "0")
+	runtime.headers.Set("x-goog-authuser", runtime.authUser())
 	runtime.headers.Set("x-user-agent", "grpc-web-javascript/0.1")
 	runtime.headers.Set("x-aistudio-visit-id", visitID)
 	if extension != "" {
@@ -259,6 +259,13 @@ func numberValue(value any) (float64, bool) {
 }
 
 // cookies 返回当前账户 Cookie 状态副本
+func (runtime *goWAARuntime) authUser() string {
+	if u := strings.TrimSpace(runtime.options.AuthUser); u != "" {
+		return u
+	}
+	return "0"
+}
+
 func (runtime *goWAARuntime) cookies() StorageState {
 	runtime.storageMu.Lock()
 	defer runtime.storageMu.Unlock()
@@ -366,7 +373,7 @@ func (runtime *goWAARuntime) rpcHeaders(apiKey string) (http.Header, error) {
 	headers.Set("Referer", aiStudioOrigin+"/")
 	headers.Set("Content-Type", "application/json+protobuf")
 	headers.Set("X-Goog-Api-Key", apiKey)
-	headers.Set("X-Goog-AuthUser", "0")
+	headers.Set("X-Goog-AuthUser", runtime.authUser())
 	headers.Set("X-User-Agent", "grpc-web-javascript/0.1")
 	headers.Set("Authorization", authorization)
 	headers.Set("Origin", aiStudioOrigin)

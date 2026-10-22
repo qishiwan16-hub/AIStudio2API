@@ -776,6 +776,7 @@ func (manager *accountWorkerManager) workerConfigFor(
 		Locale:           config.Locale,
 		Timezone:         config.Timezone,
 		Proxy:            proxy,
+		AuthUser:         config.AuthUser,
 		Headless:         true,
 		TemporaryChat:    manager.temporaryChat,
 	}

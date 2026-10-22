@@ -44,6 +44,7 @@ type Options struct {
 	Timezone         string
 	Proxy            string
 	ProxyBypass      string
+	AuthUser         string
 	Headless         bool
 	TemporaryChat    bool
 	CacheDirectory   string
